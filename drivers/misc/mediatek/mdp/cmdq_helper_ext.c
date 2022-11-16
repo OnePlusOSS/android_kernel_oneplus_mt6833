@@ -42,6 +42,10 @@
 #include <cmdq-sec.h>
 #endif
 
+#if defined(CONFIG_MACH_MT6853)
+#include <soc/mediatek/smi.h>
+#endif
+
 #define CMDQ_GET_COOKIE_CNT(thread) \
 	(CMDQ_REG_GET32(CMDQ_THR_EXEC_CNT(thread)) & CMDQ_MAX_COOKIE_VALUE)
 
@@ -67,7 +71,7 @@ static DEFINE_SPINLOCK(cmdq_write_addr_lock);
 static DEFINE_SPINLOCK(cmdq_record_lock);
 
 /* wake lock to prevnet system off */
-static struct wakeup_source mdp_wake_lock;
+static struct wakeup_source *mdp_wake_lock;
 static bool mdp_wake_locked;
 
 static struct dma_pool *mdp_rb_pool;
@@ -82,7 +86,6 @@ static struct cmdq_client *cmdq_entry;
 
 static struct cmdq_base *cmdq_client_base;
 static atomic_t cmdq_thread_usage;
-static atomic_t cmdq_thread_usage_clk;
 
 static wait_queue_head_t *cmdq_wait_queue; /* task done notify */
 static struct ContextStruct cmdq_ctx; /* cmdq driver context */
@@ -2273,7 +2276,6 @@ ssize_t cmdq_core_print_log_level(struct device *dev,
 ssize_t cmdq_core_write_log_level(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t size)
 {
-	size_t len = 0;
 	int value = 0;
 	int status = 0;
 
@@ -2285,16 +2287,15 @@ ssize_t cmdq_core_write_log_level(struct device *dev,
 			break;
 		}
 
-		len = size;
-		memcpy(textBuf, buf, len);
+		memcpy(textBuf, buf, size);
 
-		textBuf[len] = '\0';
+		textBuf[size] = '\0';
 		if (kstrtoint(textBuf, 10, &value) < 0) {
 			status = -EFAULT;
 			break;
 		}
 
-		status = len;
+		status = size;
 		if (value < 0 || value > CMDQ_LOG_LEVEL_MAX)
 			value = 0;
 
@@ -3338,6 +3339,12 @@ static void cmdq_core_group_clk_cb(bool enable,
 				cmdq_core_group_clk_off(index, engine_clk);
 		}
 	}
+
+#if defined(CONFIG_MACH_MT6853)
+	if ((engine_flag & CMDQ_ENG_MDP_GROUP_BITS) && enable)
+		smi_larb_port_check();
+#endif
+
 }
 
 bool cmdq_thread_in_use(void)
@@ -3351,7 +3358,7 @@ static void mdp_lock_wake_lock(bool lock)
 
 	if (lock) {
 		if (!mdp_wake_locked) {
-			__pm_stay_awake(&mdp_wake_lock);
+			__pm_stay_awake(mdp_wake_lock);
 			mdp_wake_locked = true;
 		} else  {
 			/* should not reach here */
@@ -3360,7 +3367,7 @@ static void mdp_lock_wake_lock(bool lock)
 		}
 	} else {
 		if (mdp_wake_locked) {
-			__pm_relax(&mdp_wake_lock);
+			__pm_relax(mdp_wake_lock);
 			mdp_wake_locked = false;
 		} else {
 			/* should not reach here */
@@ -3384,14 +3391,6 @@ static void cmdq_core_clk_enable(struct cmdqRecStruct *handle)
 	if (clock_count == 1)
 		mdp_lock_wake_lock(true);
 
-	if (!handle->secData.is_secure) {
-		s32 clk_cnt = atomic_inc_return(&cmdq_thread_usage_clk);
-
-		if (clk_cnt == 1)
-			cmdq_mbox_enable(((struct cmdq_client *)
-				handle->pkt->cl)->chan);
-	}
-
 	cmdq_core_group_clk_cb(true, handle->engineFlag, handle->engine_clk);
 }
 
@@ -3400,17 +3399,6 @@ static void cmdq_core_clk_disable(struct cmdqRecStruct *handle)
 	s32 clock_count;
 
 	cmdq_core_group_clk_cb(false, handle->engineFlag, handle->engine_clk);
-
-	if (!handle->secData.is_secure) {
-		s32 clk_cnt = atomic_dec_return(&cmdq_thread_usage_clk);
-
-		if (clk_cnt == 0)
-			cmdq_mbox_disable(((struct cmdq_client *)
-				handle->pkt->cl)->chan);
-		else if (clk_cnt < 0)
-			CMDQ_ERR("disable clock %s error usage:%d\n",
-				__func__, clk_cnt);
-	}
 
 	clock_count = atomic_dec_return(&cmdq_thread_usage);
 
@@ -3724,7 +3712,12 @@ void cmdq_core_release_handle_by_file_node(void *file_node)
 		 * immediately, but we cannot do so due to SMI hang risk.
 		 */
 		client = cmdq_clients[(u32)handle->thread];
-		cmdq_mbox_thread_remove_task(client->chan, handle->pkt);
+#if defined(CMDQ_SECURE_PATH_SUPPORT)
+		if (handle->pkt->sec_data)
+			cmdq_sec_mbox_stop(client);
+		else
+#endif
+			cmdq_mbox_thread_remove_task(client->chan, handle->pkt);
 		cmdq_pkt_auto_release_task(handle, true);
 	}
 	mutex_unlock(&cmdq_handle_list_mutex);
@@ -3828,6 +3821,12 @@ s32 cmdq_core_resume(void)
 {
 	CMDQ_VERBOSE("[RESUME] do nothing\n");
 	/* do nothing */
+	return 0;
+}
+
+s32 cmdq_core_remove(void)
+{
+	wakeup_source_unregister(mdp_wake_lock);
 	return 0;
 }
 
@@ -4504,7 +4503,7 @@ s32 cmdq_pkt_wait_flush_ex_result(struct cmdqRecStruct *handle)
 
 	status = cmdq_pkt_wait_complete(handle->pkt);
 
-	if (handle->profile_exec) {
+	if (handle->profile_exec && cmdq_util_is_feature_en(CMDQ_LOG_FEAT_PERF)) {
 		u32 *va = cmdq_pkt_get_perf_ret(handle->pkt);
 
 		if (va) {
@@ -4517,7 +4516,13 @@ s32 cmdq_pkt_wait_flush_ex_result(struct cmdqRecStruct *handle)
 				u32 cost = va[1] < va[0] ?
 					~va[0] + va[1] : va[1] - va[0];
 
+#if BITS_PER_LONG == 64
 				do_div(cost, 26);
+#elif BITS_PER_LONG == 32
+				cost /= 26;
+#else
+		#error "unsigned long division is not supported for this architecture"
+#endif
 				if (cost > 80000) {
 					CMDQ_LOG(
 						"[WARN]task executes %uus engine:%#llx caller:%llu-%s\n",
@@ -4701,8 +4706,8 @@ static s32 cmdq_pkt_flush_async_ex_impl(struct cmdqRecStruct *handle,
 	mutex_unlock(&ctx->thread[(u32)thread].thread_mutex);
 
 	if (err < 0) {
-		CMDQ_ERR("pkt flush failed err:%d pkt:0x%p thread:%d\n",
-			err, handle->pkt, thread);
+		CMDQ_ERR("pkt flush failed err:%d handle:0x%p thread:%d\n",
+			err, handle, thread);
 		return err;
 	}
 
@@ -4748,7 +4753,6 @@ s32 cmdq_pkt_flush_async_ex(struct cmdqRecStruct *handle,
 		if (thread == CMDQ_INVALID_THREAD || err == -EBUSY)
 			return err;
 		/* client may already wait for flush done, trigger as error */
-		handle->state = TASK_STATE_ERROR;
 		wake_up(&cmdq_wait_queue[(u32)thread]);
 		return err;
 	}
@@ -5017,7 +5021,7 @@ void cmdq_core_initialize(void)
 		CMDQ_BUF_ALLOC_SIZE, 0, 0);
 	atomic_set(&mdp_rb_pool_cnt, 0);
 
-	wakeup_source_add(&mdp_wake_lock);
+	mdp_wake_lock = wakeup_source_register(cmdq_dev_get(), "mdp_pm_lock");
 }
 
 #ifdef CMDQ_DAPC_DEBUG
