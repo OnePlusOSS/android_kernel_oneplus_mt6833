@@ -291,7 +291,11 @@ static int __ffs_ep0_queue_wait(struct ffs_data *ffs, char *data, size_t len)
 		req->buf = (void *)0xDEADBABE;
 
 	reinit_completion(&ffs->ep0req_completion);
-
+#ifdef OPLUS_FEATURE_CHG_BASIC
+/* Null pointer caused in special asynchronous operation */
+	if (ffs->gadget == NULL)
+		return -EINTR;
+#endif
 	ret = usb_ep_queue(ffs->gadget->ep0, req, GFP_ATOMIC);
 	if (unlikely(ret < 0))
 		return ret;
@@ -1956,6 +1960,7 @@ static void ffs_epfiles_destroy(struct ffs_epfile *epfiles, unsigned count)
 	}
 
 	kfree(epfiles);
+	epfiles = NULL;
 }
 
 static void ffs_func_eps_disable(struct ffs_function *func)
@@ -3287,6 +3292,12 @@ static int ffs_func_set_alt(struct usb_function *f,
 	struct ffs_function *func = ffs_func_from_usb(f);
 	struct ffs_data *ffs = func->ffs;
 	int ret = 0, intf;
+
+	pr_info("%s - ffs->state:%d\n", __func__, ffs->state);
+	if (ffs->epfiles == NULL) {
+		pr_info("%s - UAF fix\n", __func__);
+		return -ENODEV;
+	}
 
 	if (alt != (unsigned)-1) {
 		intf = ffs_func_revmap_intf(func, interface);
